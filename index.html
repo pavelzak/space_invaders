@@ -599,7 +599,8 @@ function createAlien(x, y, type) {
         alive: true,
         diving: false,
         diveX: 0, diveY: 0,
-        homeX: x, homeY: y,  // remember formation position
+        homeX: x, homeY: y,  // current formation position
+        spawnY: y,            // original spawn row (for wrap-to-top)
         animFrame: 0,
     };
 }
@@ -670,12 +671,14 @@ function update(dt) {
         }
     }
 
-    // Check alien reached bottom = game over
+    // Check alien reached the player level → wrap formation back to top
+    // Instead of game over, aliens teleport back to the top and the player
+    // loses a life as a penalty for letting them get that low.
     for (let a of aliveAliens) {
         const ay = a.diving ? a.y : a.homeY + getFormationOffsetY();
         if (ay + ALIEN_H >= PLAYER_Y) {
-            lives = 0;
-            playerHit(true);
+            wrapFormationToTop();
+            playerHit();
             return;
         }
     }
@@ -713,6 +716,24 @@ function updatePlayer(dt) {
 // unless diving.
 function getFormationOffsetY() {
     return formationDropAmount;
+}
+
+// When the formation gets too low, wrap all aliens back to the top of the
+// screen. Diving aliens are recalled to formation first.
+function wrapFormationToTop() {
+    // Recall any diving aliens back to formation
+    for (let a of aliens) {
+        if (!a.alive) continue;
+        a.diving = false;
+    }
+    // Reset formation drop counter and restore all aliens to their spawn rows
+    formationDropAmount = 0;
+    for (let a of aliens) {
+        if (!a.alive) continue;
+        a.homeY = a.spawnY;
+        a.y = a.spawnY;
+        a.x = a.homeX;
+    }
 }
 
 function updateFormation(dt) {
