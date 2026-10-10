@@ -122,6 +122,16 @@ canvas#game {
 #start-screen { overflow-y: auto; justify-content: flex-start; padding: 14px 8px; }
 #start-screen > h1, #start-screen > p, #start-screen > button { flex-shrink: 0; }
 
+.game-version {
+    flex-shrink: 0;
+    margin-top: auto;
+    padding-top: 12px;
+    color: #888;
+    font-size: 10px;
+    line-height: 1.4;
+    letter-spacing: 1px;
+}
+
 .overlay h1 {
     font-size: 32px;
     letter-spacing: 6px;
@@ -322,6 +332,7 @@ canvas#game {
             </p>
             <div class="lb-overlay" id="start-lb"></div>
             <button id="start-btn">START</button>
+            <small class="game-version">v2026.10.10.1</small>
         </div>
 
         <!-- Level transition -->

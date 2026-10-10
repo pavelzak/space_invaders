@@ -31,6 +31,8 @@ On Workers Free, exhausting the Workers or D1 daily quota makes requests fail un
 
 The deployed service URL is configured in [leaderboard-config.js](leaderboard-config.js). Set it to an empty string to use local scores only. If the service is unavailable, the game remains playable and shows local scores. Failed submissions remain local after bounded retries.
 
+The welcome screen shows a release version in `vYYYY.MM.DD.N` format. Update the `.game-version` label in `index.html` for each game release; increment `N` for additional releases on the same day.
+
 Run regression checks with `node --test` on Node.js 24 or later (no dependencies). They cover all levels and waves, collisions, touch/keyboard controls, local score storage, online requests, and concurrent leaderboard updates against SQLite.
 
 **Play it:** https://pavelzak.github.io/space_invaders/
