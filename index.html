@@ -363,6 +363,7 @@ canvas#game {
 </div>
 
 <script src="leaderboard-config.js"></script>
+<script src="score-signing.js?v=1"></script>
 <script>
 'use strict';
 
@@ -1671,8 +1672,18 @@ function validOnlineLeaderboard(data) {
 }
 
 async function requestOnlineLeaderboard(method, entry) {
-    // Serialize once: every retry has the same id and score, including a lost response.
-    const body = entry ? JSON.stringify(entry) : undefined;
+    // Sign and serialize once so retries keep the same submission after a lost response.
+    let body;
+    if (entry) {
+        const signer = globalThis.SpaceInvadersSigning;
+        if (typeof signer?.signSubmission !== 'function') throw new Error('Score signing unavailable');
+        const submission = { id: entry.id, name: entry.name, score: entry.score, level: entry.level };
+        const signature = await signer.signSubmission(submission);
+        if (typeof signature !== 'string' || !/^v1:[0-9a-f]{64}$/.test(signature)) {
+            throw new Error('Score signing failed');
+        }
+        body = JSON.stringify({ ...submission, signature });
+    }
     for (let attempt = 0; attempt < 3; attempt++) {
         const controller = new AbortController();
         let timer;

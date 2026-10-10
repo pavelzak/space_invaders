@@ -16,8 +16,10 @@ const response = (scores, status = 200) => ({
     async json() { return { scores }; },
 });
 const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+const SIGNATURE = 'v1:' + 'ab'.repeat(32);
 
-function app({ url = 'https://scores.example.test', fetchImpl, saved = [] } = {}) {
+function app({ url = 'https://scores.example.test', fetchImpl, saved = [],
+    signer = { async signSubmission() { return SIGNATURE; } } } = {}) {
     const elements = new Map();
     const values = new Map([['invaders_leaderboard', JSON.stringify(saved)]]);
     const calls = [];
@@ -37,6 +39,7 @@ function app({ url = 'https://scores.example.test', fetchImpl, saved = [] } = {}
         };
     }
     const context = vm.createContext({
+        SpaceInvadersSigning: signer,
         window: {
             SPACE_INVADERS_LEADERBOARD_URL: url, addEventListener() {},
             crypto: { randomUUID: () => `00000000-0000-4000-8000-${String(++uuid).padStart(12, '0')}` },
@@ -125,7 +128,11 @@ test('network failure retries finitely and shows honest local fallback', async (
 test('submission returns immediately and lost-response retries preserve one id and payload', async () => {
     const accepted = new Map();
     let posts = 0;
-    const game = app({ fetchImpl: async (_, options) => {
+    const signedEntries = [];
+    const game = app({ signer: { async signSubmission(entry) {
+        signedEntries.push(JSON.parse(JSON.stringify(entry)));
+        return SIGNATURE;
+    } }, fetchImpl: async (_, options) => {
         if (options.method === 'GET') return response([]);
         const entry = JSON.parse(options.body);
         accepted.set(entry.id, entry);
@@ -143,13 +150,68 @@ test('submission returns immediately and lost-response retries preserve one id a
     assert.equal(requests.length, 3);
     assert.equal(new Set(requests.map(request => request.body)).size, 1);
     assert.equal(accepted.size, 1);
-    assert.deepEqual(Object.keys(JSON.parse(requests[0].body)).sort(), ['id', 'level', 'name', 'score']);
-    assert.match(JSON.parse(requests[0].body).id, /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i);
+    assert.equal(signedEntries.length, 1);
+    const submitted = JSON.parse(requests[0].body);
+    assert.deepEqual(submitted, { ...signedEntries[0], signature: SIGNATURE });
+    assert.deepEqual(signedEntries[0], {
+        id: '00000000-0000-4000-8000-000000000001', name: 'Winner', score: 240, level: 1,
+    });
     assert.match(game.board(), /GLOBAL HIGH SCORES/);
     assert.match(game.board(), /Winner/);
     game.run('submitGameOver();');
     await flush();
     assert.equal(game.calls.filter(call => call.method === 'POST').length, 3);
+});
+
+test('public leaderboard reads work when the signing script is unavailable', async () => {
+    const game = app({ signer: null, fetchImpl: async () => response([row('Public score', 500)]) });
+    await flush();
+    assert.equal(game.calls.length, 1);
+    assert.equal(game.calls[0].method, 'GET');
+    assert.equal(game.calls[0].body, undefined);
+    assert.match(game.board(), /GLOBAL HIGH SCORES/);
+    assert.match(game.board(), /Public score/);
+});
+
+test('unavailable or failed signing preserves local scores without sending unsigned requests', async () => {
+    const unavailableSigners = [
+        null,
+        {},
+        { async signSubmission() { throw new Error('Web Crypto unavailable'); } },
+        { async signSubmission() { return ''; } },
+        { async signSubmission() { return undefined; } },
+    ];
+    for (const signer of unavailableSigners) {
+        const game = app({ signer });
+        await flush();
+        game.submit('Local pilot', 600);
+        assert.equal(game.run('gameState'), 'start');
+        await game.advance(1000);
+        assert.equal(game.calls.filter(call => call.method === 'POST').length, 0);
+        assert.equal(JSON.parse(game.values.get('invaders_leaderboard'))[0].score, 600);
+        assert.match(game.board(), /ON THIS DEVICE/);
+        assert.match(game.board(), /Local pilot/);
+        assert.match(game.board(), /Global scores unavailable/);
+    }
+});
+
+test('signing runs in the background and a delayed submission cannot replace a newer refresh', async () => {
+    let finishSigning;
+    const game = app({
+        signer: { signSubmission() { return new Promise(resolve => { finishSigning = resolve; }); } },
+        fetchImpl: async (_, options) => response([row(options.method === 'GET' ? 'Latest board' : 'Old submission')]),
+    });
+    await flush();
+    game.submit('Pending pilot', 700);
+    assert.equal(game.run('gameState'), 'start');
+    assert.equal(game.calls.filter(call => call.method === 'POST').length, 0);
+    assert.equal(JSON.parse(game.values.get('invaders_leaderboard'))[0].score, 700);
+    await game.run('refreshOnlineLeaderboard()');
+    finishSigning(SIGNATURE);
+    await flush();
+    assert.equal(game.calls.filter(call => call.method === 'POST').length, 1);
+    assert.match(game.board(), /Latest board/);
+    assert.doesNotMatch(game.board(), /Old submission/);
 });
 
 test('hanging requests time out, abort, and stop after three attempts', async () => {

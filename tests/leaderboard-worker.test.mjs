@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { createWorker } from '../backend/worker.mjs';
+import signing from '../score-signing.js';
 
 const ORIGIN = 'https://pavelzak.github.io';
 const uuid = number => `00000000-0000-4000-8000-${number.toString(16).padStart(12, '0')}`;
@@ -35,7 +36,9 @@ class MemoryD1 {
                 async first() {
                     database.gets++;
                     if (database.failReads) throw new Error(database.failReads);
-                    return statement.get(...parameters) ?? null;
+                    const row = statement.get(...parameters) ?? null;
+                    if (database.readBarrier) await database.readBarrier();
+                    return row;
                 },
                 async run() {
                     database.writes.push({ sql, parameters });
@@ -58,6 +61,20 @@ class MemoryD1 {
     get revision() { return this.sqlite.prepare('SELECT revision FROM leaderboard_state WHERE id = 1').get()?.revision ?? null; }
     scores() { return JSON.parse(this.value).scores; }
 
+    synchronizeReads(count) {
+        // HMAC completion order is unspecified. Hold both snapshots so the test
+        // exercises the production CAS conflict even when crypto finishes serially.
+        let release;
+        const ready = new Promise(resolve => { release = resolve; });
+        this.readBarrier = async () => {
+            if (--count === 0) {
+                delete this.readBarrier;
+                release();
+            }
+            await ready;
+        };
+    }
+
     corrupt(data, revision = 1) {
         // Simulate legacy/manual corruption, including values now rejected by the schema.
         this.sqlite.exec('PRAGMA ignore_check_constraints = ON');
@@ -76,14 +93,24 @@ function app(database = new MemoryD1(), options = {}) {
         ALLOWED_ORIGIN: ORIGIN,
         SCORE_RATE_LIMITER: { async limit({ key }) { rateKeys.push(key); return { success: !options.rateLimited }; } },
     };
-    function request(method = 'GET', value, headers = {}, path = '/scores') {
+    function rawRequest(method = 'GET', value, headers = {}, path = '/scores') {
         return worker.fetch(new Request(`https://scores.example${path}`, {
             method,
             headers: { Origin: ORIGIN, 'Content-Type': 'application/json', ...headers },
             ...(value === undefined ? {} : { body: typeof value === 'string' ? value : JSON.stringify(value) }),
         }), env);
     }
-    return { database, worker, env, request, pauses, rateKeys };
+    async function request(method = 'GET', value, headers = {}, path = '/scores') {
+        // Normal fixture submissions are signed like the browser. Validation tests
+        // use rawRequest so missing signatures and malformed payloads stay untouched.
+        if (method === 'POST' && value && typeof value.id === 'string' && typeof value.name === 'string'
+            && Number.isSafeInteger(value.score) && Number.isInteger(value.level)
+            && !Object.hasOwn(value, 'signature')) {
+            value = { ...value, signature: await signing.signSubmission(value) };
+        }
+        return rawRequest(method, value, headers, path);
+    }
+    return { database, worker, env, request, rawRequest, pauses, rateKeys };
 }
 
 test('an empty public board reads without creating a row or storing visitor data', async () => {
@@ -105,7 +132,8 @@ test('first submission uses conflict-safe creation, strips whitespace, and assig
     assert.equal(response.status, 200);
     const { scores } = await response.json();
     assert.equal(scores.length, 1);
-    assert.deepEqual({ ...scores[0], date: undefined }, { ...submission(10, { name: 'Pilot', level: 6 }), date: undefined });
+    const expected = submission(10, { name: 'Pilot', level: 6 });
+    assert.deepEqual({ ...scores[0], date: undefined }, { ...expected, signature: await signing.signSubmission(expected), date: undefined });
     assert.ok(Date.parse(scores[0].date) >= before && Date.parse(scores[0].date) <= Date.now());
     assert.deepEqual(api.rateKeys, ['submit:192.0.2.1']);
     assert.doesNotMatch(api.database.value, /192\.0\.2|spoofed|Connecting|Forwarded/);
@@ -115,15 +143,18 @@ test('first submission uses conflict-safe creation, strips whitespace, and assig
 
 test('two simultaneous first submissions cannot overwrite each other', async () => {
     const api = app();
+    api.database.synchronizeReads(2);
     const responses = await Promise.all([api.request('POST', submission(1)), api.request('POST', submission(2))]);
     assert.deepEqual(responses.map(response => response.status), [200, 200]);
     assert.equal(api.database.conflicts, 1);
     assert.deepEqual(new Set(api.database.scores().map(row => row.id)), new Set([uuid(1), uuid(2)]));
+    for (const row of api.database.scores()) assert.ok(await signing.verifySubmission(row, row.signature));
     assert.equal(api.pauses.length, 1);
 });
 
 test('concurrent updates merge with the latest state after a revision conflict', async () => {
     const api = app(new MemoryD1([saved(1)]));
+    api.database.synchronizeReads(2);
     const responses = await Promise.all([
         api.request('POST', submission(2, { score: 500 })),
         api.request('POST', submission(3, { score: 1500 })),
@@ -134,10 +165,15 @@ test('concurrent updates merge with the latest state after a revision conflict',
     assert.equal(api.database.writes[0].parameters[1], 1);
     assert.equal(api.database.writes.at(-1).parameters[1], 2);
     assert.equal(api.database.revision, 3);
+    assert.deepEqual(api.database.scores().find(row => row.id === uuid(1)), saved(1));
+    for (const row of api.database.scores().filter(row => row.id !== uuid(1))) {
+        assert.ok(await signing.verifySubmission(row, row.signature));
+    }
 });
 
 test('retrying an accepted submission is idempotent, including after simultaneous requests', async () => {
     const api = app();
+    api.database.synchronizeReads(2);
     const responses = await Promise.all([api.request('POST', submission()), api.request('POST', submission())]);
     assert.deepEqual(responses.map(response => response.status), [200, 200]);
     const original = api.database.value;
@@ -187,11 +223,58 @@ test('malformed submissions never read or replace the shared state', async () =>
         submission(1, { date: '2020-01-01' }), submission(1, { scores: [] }),
     ]) {
         const api = app(new MemoryD1([saved()]));
-        const response = await api.request('POST', invalid);
+        const response = await api.rawRequest('POST', invalid);
         assert.equal(response.status, 400, JSON.stringify(invalid));
         assert.equal(api.database.gets, 0);
         assert.equal(api.database.writes.length, 0);
     }
+});
+
+test('missing, malformed, and forged signatures are rejected before any D1 access', async () => {
+    const invalid = [
+        submission(),
+        ...[null, false, 123, {}, [], '', 'v1:bad', `v2:${'0'.repeat(64)}`, `v1:${'0'.repeat(64)}`]
+            .map(signature => ({ ...submission(), signature })),
+    ];
+    for (const payload of invalid) {
+        const api = app(new MemoryD1([saved()]));
+        const original = api.database.value;
+        const response = await api.rawRequest('POST', payload);
+        assert.equal(response.status, 403);
+        assert.match((await response.json()).error, /Reload the game/);
+        assert.equal(response.headers.get('Retry-After'), null);
+        assert.equal(api.database.gets, 0);
+        assert.equal(api.database.writes.length, 0);
+        assert.equal(api.database.value, original);
+    }
+});
+
+test('changing any signed score field is rejected before reading or writing D1', async () => {
+    const entry = submission();
+    const signature = await signing.signSubmission(entry);
+    for (const change of [{ id: uuid(2) }, { name: 'Impostor' }, { score: 1001 }, { level: 4 }]) {
+        const api = app(new MemoryD1([saved()]));
+        const response = await api.rawRequest('POST', { ...entry, ...change, signature });
+        assert.equal(response.status, 403, JSON.stringify(change));
+        assert.equal(api.database.gets, 0);
+        assert.equal(api.database.writes.length, 0);
+    }
+});
+
+test('legacy unsigned scores remain readable, deduplicate signed retries, and survive new signed writes', async () => {
+    const legacy = saved(1);
+    const api = app(new MemoryD1([legacy]));
+    assert.deepEqual(await (await api.request()).json(), { scores: [legacy] });
+    const original = api.database.value;
+    assert.equal((await api.request('POST', submission(1))).status, 200);
+    assert.equal(api.database.value, original);
+    assert.equal(api.database.writes.length, 0);
+    assert.equal((await api.request('POST', submission(2, { name: 'Игрок', score: 2000 }))).status, 200);
+    const rows = api.database.scores();
+    assert.deepEqual(rows.find(row => row.id === legacy.id), legacy);
+    const added = rows.find(row => row.id === uuid(2));
+    assert.ok(await signing.verifySubmission(added, added.signature));
+    assert.deepEqual((await (await api.request()).json()).scores, rows);
 });
 
 test('only JSON is accepted, with bounds on both declared and streamed body size', async () => {
@@ -245,6 +328,8 @@ test('corrupt stored JSON, schema, rows, or duplicate IDs never get overwritten'
         JSON.stringify({ version: 1, scores: [saved(1, { score: -1 })] }),
         JSON.stringify({ version: 1, scores: [saved(1, { date: '2026-10-10' })] }),
         JSON.stringify({ version: 1, scores: [saved(1, { secret: 'never returned' })] }),
+        JSON.stringify({ version: 1, scores: [saved(1, { signature: 'invalid' })] }),
+        JSON.stringify({ version: 1, scores: [saved(1, { signature: null })] }),
         JSON.stringify({ version: 1, scores: [saved(), saved()] }),
         JSON.stringify({ version: 1, scores: Array.from({ length: 101 }, (_, i) => saved(i + 1)) }),
         ' '.repeat(65537),

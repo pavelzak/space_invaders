@@ -1,6 +1,8 @@
 # Shared leaderboard
 
-The game stays on GitHub Pages. This small Cloudflare Worker stores the best 100 runs as JSON in one D1 database row and serves the top 10 through `/scores`. The browser submits one result at a time; database access stays inside the Worker. Players do not need accounts or credentials.
+The game stays on GitHub Pages. This small Cloudflare Worker stores the best 100 runs as JSON in one D1 database row and serves the top 10 through `/scores`. The browser submits one signed result at a time; database access stays inside the Worker. Players do not need to log in.
+
+The browser and Worker share [score-signing.js](../score-signing.js), which computes and verifies HMAC-SHA256 signatures. Its key bytes are lightly obfuscated in the public browser code. This is a barrier to casual hand-written requests, not a secret or proof of gameplay: a determined player can extract the key or call the signer to forge scores. No database credentials are exposed.
 
 The Worker reads the JSON and its revision, merges the new result, and updates only if the revision still matches. First creation inserts only if the row is absent. D1 checks these conditions atomically. A competing write causes a fresh read and merge, with up to five attempts and a short backoff. Queries use D1's primary database, so retries do not read a stale replica. See [D1's database API](https://developers.cloudflare.com/d1/worker-api/d1-database/).
 
@@ -44,6 +46,8 @@ window.SPACE_INVADERS_LEADERBOARD_URL = 'https://space-invaders-leaderboard.YOUR
 
 Publish the updated game files to GitHub Pages. A blank URL keeps the game in local-only leaderboard mode. The API URL is public configuration, not a secret. For a different game host, change `ALLOWED_ORIGIN` in `wrangler.jsonc` to its exact origin (scheme and host, no path or trailing slash), then redeploy the Worker.
 
+Publish `score-signing.js` with the game. The Worker bundles the same file at deployment. If you change the key or signature protocol, redeploy both the Worker and browser files and change the signing script's version query in `index.html` to invalidate old asset caches. Cached game versions that send unsigned submissions must be reloaded; rejected submissions still stay in local scores. Existing stored scores without signatures remain readable and are preserved.
+
 Check the deployed `/scores` URL: it should initially return `{"scores":[]}`. Finish a game in one browser, submit a score, and open the game in another browser to verify sharing. The game also keeps local scores when the network is unavailable.
 
 ## Local testing
@@ -54,7 +58,7 @@ From the repository root, the dependency-free tests run on Node.js 24 or later w
 node --test
 ```
 
-The backend tests run the real schema and queries against SQLite. They cover competing initial creations, competing updates, request retries, invalid input, CORS, rate limits, quota/storage failures, and corrupted state. If your sandbox blocks Node's test subprocess reporting, use `node --test --test-isolation=none tests/leaderboard-worker.test.mjs` on Node 24.
+The backend tests run the real schema and queries against SQLite. They cover signature verification, competing initial creations, competing updates, request retries, invalid input, CORS, rate limits, quota/storage failures, and corrupted state. Signing tests check altered fields, malformed signatures, deterministic retries, and browser/Worker compatibility. If your sandbox blocks Node's test subprocess reporting, use `node --test --test-isolation=none tests/leaderboard-worker.test.mjs` on Node 24.
 
 To validate the deployment bundle without publishing anything, run from `backend/`:
 
@@ -73,7 +77,7 @@ Serve the repository in another terminal with `python3 -m http.server 8000`, tem
 
 ## API and limits
 
-`GET /scores` returns `{"scores":[...]}`, ordered by score descending, then level descending, then earliest server timestamp and ID. Each result has `id`, `name`, `score`, `level`, and an ISO `date`. Reads require no login; browser CORS is enabled only for `ALLOWED_ORIGIN`.
+`GET /scores` returns `{"scores":[...]}`, ordered by score descending, then level descending, then earliest server timestamp and ID. Each result has `id`, `name`, `score`, `level`, and an ISO `date`; newly stored results also have `signature`. Reads require no login or signature; browser CORS is enabled only for `ALLOWED_ORIGIN`.
 
 `POST /scores` accepts `Content-Type: application/json` and exactly these fields:
 
@@ -82,14 +86,17 @@ Serve the repository in another terminal with `python3 -m http.server 8000`, tem
   "id": "00000000-0000-4000-8000-000000000001",
   "name": "Pilot",
   "score": 1450,
-  "level": 4
+  "level": 4,
+  "signature": "v1:<64 lowercase hexadecimal HMAC characters>"
 }
 ```
 
-Names are trimmed and limited to 12 characters; scores must be integers from 0 to 100000; levels must be integers from 1 to 6. Requests are limited to 8 KiB. The Worker assigns the timestamp. The browser must reuse the same UUID and payload when retrying a submission. A duplicate retained ID returns the existing board without writing; a different payload using that ID returns `409`. Only the best 100 runs are retained, so IDs belonging to evicted runs are no longer remembered.
+The signature above is a placeholder. The game generates it with `SpaceInvadersSigning.signSubmission(entry)`, where `entry` contains the other four fields. The signed bytes are UTF-8 JSON for `["space-invaders:score:v1", id.toLowerCase(), name.trim(), score, level]`. The Worker rejects missing or invalid signatures with `403` before any D1 read or write. The timestamp is assigned by the server and is not part of the browser signature. A failed or unavailable browser signer falls back to local scores instead of sending an unsigned request.
+
+Names are trimmed and limited to 12 characters; scores must be integers from 0 to 100000; levels must be integers from 1 to 6. Requests are limited to 8 KiB. The browser signs once and reuses the same UUID, payload, and signature on retries. A duplicate retained ID returns the existing board without writing; a different payload using that ID returns `409`. Only the best 100 runs are retained, so IDs belonging to evicted runs are no longer remembered.
 
 Successful submissions return the current top 10. Errors return `{"error":"..."}`. `429` and temporary `503` responses include `Retry-After`; a busy board gets five merge attempts before a `503`. Malformed existing state or an exhausted D1 quota returns `503`; the Worker preserves existing data. If the Workers request quota is exhausted, Cloudflare rejects requests before our code runs and the client falls back to local scores.
 
 The configured rate-limit binding allows approximately 10 submissions per minute per Cloudflare-provided IP address per Cloudflare location. Players sharing an IP share that allowance; IP addresses are not written into the leaderboard. Cloudflare's limiter is approximate and local to each location, so it is an abuse deterrent rather than a global hard quota. See [rate-limit bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
 
-Scores and names are public and self-reported. CORS, validation, and rate limiting reduce accidental misuse and basic spam; they do not prove a score was earned. Someone can spoof the request origin and submit a plausible invented score. Embedding a signing key in browser JavaScript would not fix that. Stronger verification would require a server-validated game or replay system.
+Scores and names are public and self-reported. Signatures are verified when submissions arrive, then retained alongside their fields in readable JSON; the database contents are not encrypted by this scheme. Existing rows are validated structurally on reads, not cryptographically reverified. CORS, signatures, validation, and rate limiting discourage accidental misuse and casual spam. They do not prove a score was earned: someone can spoof the request origin and use the public browser key to sign an invented score. Stronger verification would require a server-validated game or replay system.

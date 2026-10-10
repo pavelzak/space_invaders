@@ -1,8 +1,11 @@
+import signing from '../score-signing.js';
+
 const MAX_BODY_BYTES = 8 * 1024;
 const MAX_STATE_BYTES = 64 * 1024;
 const MAX_STORED_SCORES = 100;
 const MAX_ATTEMPTS = 5;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SIGNATURE = /^v1:[0-9a-f]{64}$/;
 
 class HttpError extends Error {
     constructor(status, message, headers = {}) {
@@ -27,10 +30,10 @@ function validScore(value) {
 
 function normalizeSubmission(value) {
     if (!validScore(value)
-        || Object.keys(value).some(key => !['id', 'name', 'score', 'level'].includes(key))) {
+        || Object.keys(value).some(key => !['id', 'name', 'score', 'level', 'signature'].includes(key))) {
         throw new HttpError(400, 'Expected a UUID, a name of 1–12 characters, a score from 0–100000, and a level from 1–6.');
     }
-    return { id: value.id.toLowerCase(), name: value.name.trim(), score: value.score, level: value.level };
+    return { id: value.id.toLowerCase(), name: value.name.trim(), score: value.score, level: value.level, signature: value.signature };
 }
 
 function rankScores(scores) {
@@ -63,7 +66,8 @@ async function readScores(database) {
         if (!validScore(score) || score.id !== score.id.toLowerCase() || score.name !== score.name.trim()
             || typeof score.date !== 'string' || !Number.isFinite(Date.parse(score.date))
             || new Date(score.date).toISOString() !== score.date || ids.has(score.id)
-            || Object.keys(score).some(key => !['id', 'name', 'score', 'level', 'date'].includes(key))) {
+            || ('signature' in score && (typeof score.signature !== 'string' || !SIGNATURE.test(score.signature)))
+            || Object.keys(score).some(key => !['id', 'name', 'score', 'level', 'date', 'signature'].includes(key))) {
             throw storageUnavailable();
         }
         ids.add(score.id);
@@ -189,6 +193,12 @@ export function createWorker({ pause = milliseconds => new Promise(resolve => se
                 });
                 if (!success) throw new HttpError(429, 'Too many submissions. Please try again later.', { 'Retry-After': '60' });
                 const submission = await readSubmission(request);
+                // This shared browser key deters casual edits; it cannot prove a score was earned.
+                // Verify before any D1 access, including the duplicate-submission lookup.
+                if (typeof submission.signature !== 'string' || !SIGNATURE.test(submission.signature)
+                    || !await signing.verifySubmission(submission, submission.signature)) {
+                    throw new HttpError(403, 'Reload the game and submit again. The score signature is missing or invalid.');
+                }
                 const scores = await saveScore(env.LEADERBOARD_DB, submission, pause);
                 return json({ scores });
             } catch (error) {
