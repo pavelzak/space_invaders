@@ -1,0 +1,25 @@
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "space-invaders-leaderboard",
+    "main": "worker.mjs",
+    "compatibility_date": "2026-10-10",
+    "workers_dev": true,
+    "vars": {
+        "ALLOWED_ORIGIN": "https://pavelzak.github.io"
+    },
+    "d1_databases": [
+        {
+            "binding": "LEADERBOARD_DB",
+            "database_name": "space-invaders",
+            "database_id": "8f52b32e-090b-46e0-b560-e695ad706e7f"
+        }
+    ],
+    "ratelimits": [
+        {
+            "name": "SCORE_RATE_LIMITER",
+            // Pick another positive integer if this namespace is used by another Worker in your account.
+            "namespace_id": "16216001",
+            "simple": { "limit": 10, "period": 60 }
+        }
+    ]
+}

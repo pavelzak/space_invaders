@@ -171,8 +171,8 @@ test('returning aliens finish docking before attacking again', () => {
 test('a returner catches its slot at the fastest configured formation speed', () => {
     const run = game();
     run(`
-        startLevel(3);
-        wave = 2;
+        startLevel(LEVELS.length);
+        wave = totalWaves;
         spawnWave();
         diveTimer = -1e9;
         aliens = [createAlien(500, 100, 0)];
@@ -192,7 +192,8 @@ test('a returner catches its slot at the fastest configured formation speed', ()
 test('last-life contact with the last alien ends the game without awarding victory', () => {
     const run = game();
     run(`
-        level = 3;
+        startLevel(LEVELS.length);
+        playerInvuln = 0;
         wave = totalWaves;
         lives = 1;
         aliens = [createAlien(player.x, player.y, 0)];
@@ -205,7 +206,8 @@ test('last-life contact with the last alien ends the game without awarding victo
 
 test('every level and wave starts inside the arena with room to move', () => {
     const run = game();
-    for (let level = 1; level <= 3; level++) {
+    assert.equal(run('LEVELS.length'), 6);
+    for (let level = 1; level <= run('LEVELS.length'); level++) {
         run(`startLevel(${level});`);
         for (let wave = 1; wave <= run('totalWaves'); wave++) {
             run(`wave = ${wave}; spawnWave();`);
@@ -213,15 +215,19 @@ test('every level and wave starts inside the arena with room to move', () => {
                 `level ${level}, wave ${wave} starts offscreen`);
             const width = run('Math.max(...aliens.map(a => a.x + a.w)) - Math.min(...aliens.map(a => a.x))');
             assert(width <= 480, `level ${level}, wave ${wave} has no space to travel`);
+            assert(run('aliens.every(a => a.y >= 0 && a.y + a.h < CH - 120)'), 'aliens spawn above the bunkers');
+            assert(run('aliens.every((a, i) => aliens.slice(i + 1).every(b => !rectsOverlap(a.x, a.y, a.w, a.h, b.x, b.y, b.w, b.h)))'),
+                `level ${level} has overlapping aliens`);
+            if (level === 3) assert.equal(run('aliens.length'), 42);
         }
     }
-    assert.equal(run('aliens.length'), 42);
 });
 
 test('full formations stay within bounds and traverse before each drop', () => {
     const run = game();
-    for (let level = 1; level <= 3; level++) {
-        for (let wave = 1; wave <= (level === 1 ? 1 : 2); wave++) {
+    for (let level = 1; level <= run('LEVELS.length'); level++) {
+        run(`startLevel(${level});`);
+        for (let wave = 1; wave <= run('totalWaves'); wave++) {
             for (const dt of [1 / 144, 1 / 60, 0.05]) {
                 run(`
                     startLevel(${level});
@@ -252,7 +258,7 @@ test('full formations stay within bounds and traverse before each drop', () => {
 
 test('clearing every wave progresses through all levels to victory', () => {
     const run = game();
-    for (let level = 1; level <= 3; level++) {
+    for (let level = 1; level <= run('LEVELS.length'); level++) {
         assert.equal(run('level'), level);
         const waves = run('totalWaves');
         for (let wave = 1; wave <= waves; wave++) {
@@ -263,13 +269,41 @@ test('clearing every wave progresses through all levels to victory', () => {
                 assert(run('aliens.length > 0 && aliens.every(a => a.alive)'));
             }
         }
-        if (level < 3) {
+        if (level < run('LEVELS.length')) {
             assert.equal(run('gameState'), 'levelTransition');
             run('continueToNextLevel();');
         }
     }
     assert.equal(run('gameState'), 'victory');
     assert.equal(run('lives'), 3);
+});
+
+test('new levels use distinct formations and increase the challenge gradually', () => {
+    const run = game();
+    const shapes = new Set();
+    let previousSpeed = 0;
+    let previousFireInterval = Infinity;
+    for (let level = 1; level <= run('LEVELS.length'); level++) {
+        run(`startLevel(${level});`);
+        shapes.add(run('JSON.stringify(aliens.map(a => [a.x, a.y]))'));
+        assert(run('formationSpeed') > previousSpeed);
+        assert(run('alienFireInterval') < previousFireInterval);
+        previousSpeed = run('formationSpeed');
+        previousFireInterval = run('alienFireInterval');
+        run('wave = totalWaves; spawnWave();');
+        assert(run('formationSpeed * 3 < ALIEN_RETURN_SPEED'), 'returners must be able to catch the fleet');
+    }
+    assert.equal(shapes.size, 6);
+});
+
+test('respawning a wave does not keep multiplying its difficulty', () => {
+    const run = game();
+    run('startLevel(LEVELS.length); wave = totalWaves; spawnWave();');
+    const speed = run('formationSpeed');
+    const interval = run('alienFireInterval');
+    run('spawnWave(); spawnWave();');
+    assert.equal(run('formationSpeed'), speed);
+    assert.equal(run('alienFireInterval'), interval);
 });
 
 test('a slow frame still registers a shot crossing a descending alien', () => {

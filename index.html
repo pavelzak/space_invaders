@@ -94,6 +94,8 @@ canvas#game {
     border: 1px solid #1a1a2a;
     border-radius: 4px;
     display: block;
+    touch-action: none;
+    -webkit-touch-callout: none;
 }
 
 .board-wrapper {
@@ -116,6 +118,9 @@ canvas#game {
 }
 
 .overlay.active { display: flex; }
+
+#start-screen { overflow-y: auto; justify-content: flex-start; padding: 14px 8px; }
+#start-screen > h1, #start-screen > p, #start-screen > button { flex-shrink: 0; }
 
 .overlay h1 {
     font-size: 32px;
@@ -187,7 +192,14 @@ canvas#game {
     margin: 12px 0;
     font-size: 13px;
     line-height: 1.9;
+    min-height: 52px;
+    max-height: 160px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
+
+.lb-heading, .lb-status { font-size: 11px; color: #6b6; margin-bottom: 4px; }
+.lb-status { max-width: 260px; color: #999; line-height: 1.5; }
 
 .lb-overlay .lb-row {
     display: flex;
@@ -213,6 +225,8 @@ canvas#game {
     gap: 8px;
     padding: 8px;
     margin-top: 4px;
+    touch-action: none;
+    -webkit-touch-callout: none;
 }
 
 .touch-row {
@@ -299,7 +313,7 @@ canvas#game {
             <h1>SPACE INVADERS</h1>
             <p>
                 Defend Earth from the alien invasion!<br>
-                Destroy all aliens across 3 levels.<br>
+                Destroy all aliens across <span id="level-count"></span> levels.<br>
                 Hide behind bunkers — but they break.<br>
                 <br>
                 Desktop: ← → to move, SPACE to fire<br>
@@ -348,6 +362,7 @@ canvas#game {
     </div>
 </div>
 
+<script src="leaderboard-config.js"></script>
 <script>
 'use strict';
 
@@ -706,6 +721,7 @@ let formationSoundTimer = 0;
 
 // Player fire cooldown
 let playerFireCD = 0;
+let fireRequested = false;
 let playerInvuln = 0;  // invulnerability timer after hit
 
 // Level configs
@@ -733,6 +749,59 @@ const LEVELS = [
         formation: 'vshape',
         speed: 60,
         fireRate: 1.0,
+    },
+    {
+        name: "LEVEL 4 — TWIN WINGS",
+        desc: "Two attack wings leave a narrow central corridor.\nWatch for frequent dives from both sides!",
+        waves: 2,
+        formation: 'twins',
+        speed: 66,
+        fireRate: 0.85,
+        diveCooldown: 2.7,
+        pattern: [
+            '00100000100',
+            '01110001110',
+            '11111011111',
+            '11111011111',
+            '01110001110',
+            '00100000100',
+        ],
+    },
+    {
+        name: "LEVEL 5 — ORBITAL RING",
+        desc: "An alien ring surrounds its command ship.\nBreak the perimeter and dodge their counterattack!",
+        waves: 2,
+        formation: 'ring',
+        speed: 72,
+        fireRate: 0.75,
+        diveCooldown: 2.4,
+        pattern: [
+            '00011111000',
+            '01110001110',
+            '11000000011',
+            '11000100011',
+            '11000000011',
+            '01110001110',
+            '00011111000',
+        ],
+    },
+    {
+        name: "LEVEL 6 — FINAL FORTRESS",
+        desc: "The last fleet guards a fortified alien stronghold.\nSurvive two final waves to save Earth!",
+        waves: 2,
+        formation: 'fortress',
+        speed: 78,
+        fireRate: 0.65,
+        diveCooldown: 2.1,
+        pattern: [
+            '11111111111',
+            '10101010101',
+            '11111111111',
+            '01110101110',
+            '01110101110',
+            '00110001100',
+            '00110001100',
+        ],
     },
 ];
 
@@ -838,6 +907,7 @@ function startLevel(lvl) {
     }
     playerInvuln = 2.0;
     playerFireCD = 0;
+    fireRequested = false;
 
     spawnWave();
     createBunkers();
@@ -849,6 +919,11 @@ function spawnWave() {
     formationDir = 1;
     formationDropAmount = 0;
     formationSoundTimer = 0;
+    // Derive difficulty from the wave, so respawning cannot compound it.
+    formationSpeed = config.speed * Math.pow(1.2, wave - 1);
+    alienFireInterval = config.fireRate * Math.pow(0.85, wave - 1);
+    alienFireTimer = alienFireInterval;
+    diveTimer = 0;
 
     const formation = config.formation;
     const startY = 60;
@@ -922,12 +997,22 @@ function spawnWave() {
                 ));
             }
         }
-    }
-
-    // Scale speed up for later waves
-    if (wave > 1) {
-        formationSpeed *= 1.2;
-        alienFireInterval *= 0.85;
+    } else if (config.pattern) {
+        // Eleven columns fit in 432px, leaving room for the fleet to patrol.
+        const spacingX = ALIEN_W + 8;
+        const cols = config.pattern[0].length;
+        const startX = (CW - (cols - 1) * spacingX - ALIEN_W) / 2;
+        for (let r = 0; r < config.pattern.length; r++) {
+            for (let c = 0; c < cols; c++) {
+                if (config.pattern[r][c] !== '1') continue;
+                const type = r < 2 ? 0 : (r < 5 ? 1 : 2);
+                aliens.push(createAlien(
+                    startX + c * spacingX,
+                    startY + r * ALIEN_SPACING_Y,
+                    type
+                ));
+            }
+        }
     }
 }
 
@@ -1012,7 +1097,7 @@ function updateStep(dt) {
             updateHUD();
         } else {
             // Level complete
-            if (level < 3) {
+            if (level < LEVELS.length) {
                 showLevelTransition();
             } else {
                 showVictory();
@@ -1052,7 +1137,10 @@ function updatePlayer(dt) {
 
     // Firing
     playerFireCD -= dt;
-    if ((keys[' '] || keys['Spacebar']) && playerFireCD <= 0) {
+    // Preserve a quick tap until the next eligible shot, even if touchend
+    // arrives before an animation frame or while the previous shot cools down.
+    if ((fireRequested || keys[' '] || keys['Spacebar']) && playerFireCD <= 0) {
+        fireRequested = false;
         fireBullet();
         playerFireCD = PLAYER_FIRE_CD;
     }
@@ -1116,7 +1204,8 @@ function updateFormation(dt) {
     // Occasionally trigger dives
     diveTimer += dt;
     const diveChance = 1 - Math.pow(1 - ALIEN_DIVE_CHANCE, dt * 60);
-    if (diveTimer > 3.0 && Math.random() < diveChance && count > 3) {
+    const diveCooldown = LEVELS[level - 1].diveCooldown ?? 3.0;
+    if (diveTimer > diveCooldown && Math.random() < diveChance && count > 3) {
         triggerDive();
         diveTimer = 0;
     }
@@ -1506,6 +1595,13 @@ function showVictory() {
 const LB_KEY = 'invaders_leaderboard';
 const sessionScoreStorage = new Map();
 const unsavedScoreKeys = new Set();
+// This public service URL is optional. No account or credentials are sent.
+const LEADERBOARD_URL = typeof window.SPACE_INVADERS_LEADERBOARD_URL === 'string'
+    ? window.SPACE_INVADERS_LEADERBOARD_URL.trim().replace(/\/+$/, '') : '';
+const LEADERBOARD_TIMEOUT_MS = 4000;
+let onlineLeaderboard = null;
+let onlineLeaderboardStatus = 'local';
+let leaderboardRequestVersion = 0;
 
 // Scores remain usable for this session when browser storage is blocked or full.
 function readScoreStorage(key) {
@@ -1556,8 +1652,106 @@ function addToLeaderboard(name, sc, lvl) {
     renderLeaderboards();
 }
 
+function newScoreId() {
+    if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    if (window.crypto?.getRandomValues) window.crypto.getRandomValues(bytes);
+    else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+    return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
+}
+
+function validOnlineLeaderboard(data) {
+    if (!data || !Array.isArray(data.scores)) throw new Error('Invalid leaderboard response');
+    return validLeaderboard(data.scores.filter(entry => entry &&
+        typeof entry.name === 'string' && entry.name.trim().length >= 1 && entry.name.trim().length <= 12 &&
+        Number.isSafeInteger(entry.score) && entry.score <= 100000));
+}
+
+async function requestOnlineLeaderboard(method, entry) {
+    // Serialize once: every retry has the same id and score, including a lost response.
+    const body = entry ? JSON.stringify(entry) : undefined;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const controller = new AbortController();
+        let timer;
+        try {
+            const timeout = new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                    const error = new Error('Leaderboard timed out');
+                    error.retryable = true;
+                    reject(error);
+                    controller.abort();
+                }, LEADERBOARD_TIMEOUT_MS);
+            });
+            const request = (async () => {
+                let response;
+                try {
+                    response = await fetch(LEADERBOARD_URL + '/scores', {
+                        method, body, signal: controller.signal,
+                        headers: entry ? { 'Content-Type': 'application/json', Accept: 'application/json' } : { Accept: 'application/json' },
+                        credentials: 'omit', cache: 'no-store', mode: 'cors',
+                    });
+                } catch (error) {
+                    error.retryable = true;
+                    throw error;
+                }
+                if (!response.ok) {
+                    const error = new Error('Leaderboard request failed');
+                    error.retryable = response.status === 429 || response.status >= 500;
+                    const retryAfter = Number(response.headers?.get('Retry-After'));
+                    if (Number.isFinite(retryAfter) && retryAfter > 0) {
+                        error.retryAfter = retryAfter * 1000;
+                        if (error.retryAfter > 5000) error.retryable = false;
+                    }
+                    throw error;
+                }
+                let data;
+                try {
+                    data = await response.json();
+                } catch (error) {
+                    error.retryable = true;
+                    throw error;
+                }
+                return validOnlineLeaderboard(data);
+            })();
+            return await Promise.race([request, timeout]);
+        } catch (error) {
+            clearTimeout(timer);
+            if (!error.retryable || attempt === 2) throw error;
+            await new Promise(resolve => setTimeout(resolve, error.retryAfter || 300 * (attempt + 1)));
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+}
+
+async function refreshOnlineLeaderboard(entry) {
+    if (!LEADERBOARD_URL) return;
+    const version = ++leaderboardRequestVersion;
+    onlineLeaderboardStatus = entry ? 'saving' : 'loading';
+    renderLeaderboards();
+    try {
+        const entries = await requestOnlineLeaderboard(entry ? 'POST' : 'GET', entry);
+        if (version !== leaderboardRequestVersion) return;
+        onlineLeaderboard = entries;
+        onlineLeaderboardStatus = 'ready';
+    } catch {
+        if (version !== leaderboardRequestVersion) return;
+        onlineLeaderboardStatus = 'offline';
+    }
+    renderLeaderboards();
+}
+
+function publishScore(name, sc, lvl) {
+    if (!LEADERBOARD_URL) return;
+    refreshOnlineLeaderboard({ id: newScoreId(), name, score: sc, level: lvl });
+}
+
 function renderLeaderboards() {
-    const entries = getLeaderboard();
+    const globalAvailable = onlineLeaderboard !== null && onlineLeaderboardStatus !== 'offline';
+    const entries = globalAvailable ? onlineLeaderboard : getLeaderboard();
     const html = entries.length === 0
         ? '<div style="color:#333;">No scores yet</div>'
         : entries.map((e, i) => {
@@ -1569,7 +1763,14 @@ function renderLeaderboards() {
                 '</div>';
         }).join('');
     const startLb = document.getElementById('start-lb');
-    if (startLb) startLb.innerHTML = '<div style="font-size:11px;color:#4a4;margin-bottom:4px;">HIGH SCORES</div>' + html;
+    const heading = globalAvailable ? 'GLOBAL HIGH SCORES' : 'HIGH SCORES · ON THIS DEVICE';
+    const status = {
+        loading: 'Loading global scores…',
+        saving: 'Sending score…',
+        offline: 'Global scores unavailable; showing this device.',
+    }[onlineLeaderboardStatus] || '';
+    if (startLb) startLb.innerHTML = '<div class="lb-heading">' + heading + '</div>' +
+        (status ? '<div class="lb-status" role="status">' + status + '</div>' : '') + html;
 }
 
 function escapeHtml(text) {
@@ -1615,6 +1816,7 @@ function submitGameOver() {
     addToLeaderboard(name, score, level);
     showOverlay('start-screen');
     gameState = 'start';
+    publishScore(name, score, level);
 }
 
 function submitVictory() {
@@ -1625,6 +1827,7 @@ function submitVictory() {
     addToLeaderboard(name, score, level);
     showOverlay('start-screen');
     gameState = 'start';
+    publishScore(name, score, level);
 }
 
 // ============================================================
@@ -1649,19 +1852,25 @@ const inputSources = new Map();
 let canvasTouchId = null;
 let canvasTouchStartX = 0;
 
-function setInputSource(source, heldKeys) {
+function setInputSource(source, heldKeys, cancelled = false) {
+    const wasFiring = Boolean(keys[' '] || keys['Spacebar']);
+    const sourceWasFiring = inputSources.get(source)?.some(key => key === ' ' || key === 'Spacebar');
     if (heldKeys.length) inputSources.set(source, heldKeys);
     else inputSources.delete(source);
     keys = {};
     for (const sourceKeys of inputSources.values()) {
         for (const key of sourceKeys) keys[key] = true;
     }
+    const firing = Boolean(keys[' '] || keys['Spacebar']);
+    if (gameState === 'playing' && firing && !wasFiring) fireRequested = true;
+    if (cancelled && sourceWasFiring && !firing) fireRequested = false;
 }
 
 function clearInput() {
     inputSources.clear();
     keys = {};
     canvasTouchId = null;
+    fireRequested = false;
 }
 
 function inputKey(event) {
@@ -1707,9 +1916,13 @@ function bindTouchBtn(id, key) {
         e.preventDefault();
         setInputSource('touch:' + id, e.targetTouches.length ? [key] : []);
     }, { passive: false });
+    // A held thumb naturally moves. Keep Safari from treating it as a native
+    // gesture; Touch Events retain the original target even outside the button.
+    el.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
     el.addEventListener('touchcancel', function(e) {
-        setInputSource('touch:' + id, e.targetTouches.length ? [key] : []);
+        setInputSource('touch:' + id, e.targetTouches.length ? [key] : [], true);
     });
+    el.addEventListener('contextmenu', e => e.preventDefault());
     // Mouse for testing
     el.addEventListener('mousedown', function(e) {
         if (e.button !== 0) return;
@@ -1717,7 +1930,7 @@ function bindTouchBtn(id, key) {
         setInputSource('mouse:' + id, [key]);
     });
     el.addEventListener('mouseup', function() { setInputSource('mouse:' + id, []); });
-    el.addEventListener('mouseleave', function() { setInputSource('mouse:' + id, []); });
+    el.addEventListener('mouseleave', function() { setInputSource('mouse:' + id, [], true); });
 }
 
 bindTouchBtn('btn-left', 'ArrowLeft');
@@ -1749,14 +1962,19 @@ bindTouchBtn('btn-fire', ' ');
         setInputSource('canvas', heldKeys);
     }, { passive: false });
 
-    function endCanvasTouch(e) {
+    function endCanvasTouch(e, cancelled = false) {
         e.preventDefault();
         if (!Array.from(e.changedTouches).some(t => t.identifier === canvasTouchId)) return;
-        canvasTouchId = null;
-        setInputSource('canvas', []);
+        // Another finger can still be holding the canvas. Hand it control with
+        // a fresh steering anchor instead of releasing Fire underneath it.
+        const remaining = e.targetTouches[0];
+        canvasTouchId = remaining ? remaining.identifier : null;
+        if (remaining) canvasTouchStartX = remaining.clientX;
+        setInputSource('canvas', remaining ? [' '] : [], cancelled);
     }
     canvas.addEventListener('touchend', endCanvasTouch, { passive: false });
-    canvas.addEventListener('touchcancel', endCanvasTouch, { passive: false });
+    canvas.addEventListener('touchcancel', e => endCanvasTouch(e, true), { passive: false });
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
 })();
 
 // Prevent zoom
@@ -1781,8 +1999,10 @@ document.getElementById('victory-name').addEventListener('keydown', function(e) 
 // ============================================================
 // INIT
 // ============================================================
+document.getElementById('level-count').textContent = LEVELS.length;
 initStars();
 renderLeaderboards();
+refreshOnlineLeaderboard();
 requestAnimationFrame(gameLoop);
 </script>
 </body>

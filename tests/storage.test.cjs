@@ -99,12 +99,13 @@ test('unavailable storage permits death, score submission, another game, and vic
     assert.equal(app.run('gameState'), 'start');
     assert(app.elements.get('start-screen').classList.contains('active'));
     assert.deepEqual(app.scores().map(e => [e.name, e.score]), [['Pilot', 123]]);
-    app.run('beginGame(); score = 456; level = 3; showVictory();');
+    app.run('beginGame(); score = 456; level = LEVELS.length; showVictory();');
     assert(app.elements.get('victory-screen').classList.contains('active'));
     assert.equal(app.elements.get('victory-name').value, 'Pilot');
     app.run('submitVictory();');
     assert.equal(app.run('gameState'), 'start');
     assert.deepEqual(app.scores().map(e => e.score), [456, 123]);
+    assert.equal(app.scores()[0].level, 6);
 });
 
 test('a storage write failure keeps existing scores and new records for this session', () => {
