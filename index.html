@@ -63,6 +63,32 @@ body {
 #level-value { color: #ff0; }
 #lives-value { color: #f44; }
 
+.audio-controls {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    width: 600px;
+    max-width: 95vw;
+}
+
+.audio-controls button {
+    min-height: 36px;
+    padding: 6px 12px;
+    border: 1px solid #285528;
+    border-radius: 4px;
+    background: #001100;
+    color: #8f8;
+    font: bold 12px 'Courier New', monospace;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.audio-controls button:hover { border-color: #0f0; }
+.audio-controls button:focus-visible { outline: 2px solid #ff0; outline-offset: 2px; }
+.audio-controls button[aria-pressed="false"] { color: #888; background: #080808; }
+.audio-controls button:disabled { cursor: default; opacity: 0.5; }
+
 canvas#game {
     background: #000;
     border: 1px solid #1a1a2a;
@@ -191,9 +217,14 @@ canvas#game {
 
 .touch-row {
     display: flex;
-    gap: 8px;
-    justify-content: center;
+    gap: clamp(16px, 5vw, 32px);
     width: 100%;
+}
+
+.touch-movement {
+    display: flex;
+    flex: 2;
+    gap: 8px;
 }
 
 .touch-btn {
@@ -209,6 +240,7 @@ canvas#game {
     align-items: center;
     justify-content: center;
     cursor: pointer;
+    touch-action: none;
     -webkit-tap-highlight-color: transparent;
     transition: background 0.1s;
 }
@@ -221,6 +253,7 @@ canvas#game {
 @media (max-width: 700px) {
     .hud { width: 95vw; font-size: 12px; }
     .hud-value { font-size: 15px; }
+    .audio-controls button { min-height: 44px; }
     canvas#game { max-width: 95vw; height: auto; }
     .touch-controls { display: flex; flex-direction: column; }
     .overlay h1 { font-size: 22px; letter-spacing: 3px; }
@@ -252,6 +285,11 @@ canvas#game {
         </div>
     </div>
 
+    <div class="audio-controls" role="group" aria-label="Audio controls">
+        <button type="button" id="sfx-btn" aria-label="Sound effects" aria-pressed="true" title="Toggle sound effects. M mutes or unmutes all audio.">SFX: ON</button>
+        <button type="button" id="music-btn" aria-label="Music" aria-pressed="true" title="Toggle music. M mutes or unmutes all audio.">MUSIC: ON</button>
+    </div>
+
     <!-- Game Board -->
     <div class="board-wrapper">
         <canvas id="game" width="600" height="600"></canvas>
@@ -265,7 +303,8 @@ canvas#game {
                 Hide behind bunkers — but they break.<br>
                 <br>
                 Desktop: ← → to move, SPACE to fire<br>
-                Mobile: on-screen buttons + swipe
+                Mobile: on-screen buttons + swipe<br>
+                M: mute / unmute audio
             </p>
             <div class="lb-overlay" id="start-lb"></div>
             <button id="start-btn">START</button>
@@ -300,9 +339,11 @@ canvas#game {
     <!-- Touch Controls -->
     <div class="touch-controls" id="touch-controls">
         <div class="touch-row">
-            <div class="touch-btn" id="btn-left">◀</div>
+            <div class="touch-movement">
+                <div class="touch-btn" id="btn-left">◀</div>
+                <div class="touch-btn" id="btn-right">▶</div>
+            </div>
             <div class="touch-btn fire" id="btn-fire">⦿ FIRE</div>
-            <div class="touch-btn" id="btn-right">▶</div>
         </div>
     </div>
 </div>
@@ -331,12 +372,307 @@ const BUNKER_BLOCK = 4;  // each bunker is made of 4x4 px destructible blocks
 
 const ALIEN_FIRE_INTERVAL_MIN = 0.8;
 const ALIEN_FIRE_INTERVAL_MAX = 2.5;
-const ALIEN_DIVE_CHANCE = 0.3;  // chance per formation move to trigger a dive
+const ALIEN_DIVE_CHANCE = 0.02; // chance per 60Hz frame after the dive cooldown
 const ALIEN_DIVE_SPEED = 200;
+const ALIEN_RETURN_SPEED = 300;
 const ALIEN_BULLET_DAMAGE = 12; // bunker damage per alien bullet
 
 // Points per alien type (0=small/top, 1=medium, 2=large/bottom, 3=diving)
 const ALIEN_POINTS = [40, 20, 10, 50]; // UFO/diving worth more
+
+// ============================================================
+// ARCADE AUDIO — generated locally; no samples or downloads
+// ============================================================
+const gameAudio = (() => {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    const sfxButton = document.getElementById('sfx-btn');
+    const musicButton = document.getElementById('music-btn');
+    const voices = new Set();
+    const lastEffect = new Map();
+    let available = Boolean(AudioContextClass);
+    let context, master, musicBus, sfxBus, noiseBuffer;
+    let playing = false, currentLevel = 1;
+    let timer = null, step = 0, nextStepTime = 0, marchNote = 0;
+    let previousMix = null;
+
+    function preference(key) {
+        try { return localStorage.getItem(key) !== 'off'; }
+        catch { return true; }
+    }
+    let sfxEnabled = preference('invaders_sfx');
+    let musicEnabled = preference('invaders_music');
+
+    function updateControls() {
+        for (const [button, enabled, label] of [
+            [sfxButton, sfxEnabled, 'SFX'], [musicButton, musicEnabled, 'MUSIC'],
+        ]) {
+            button.textContent = label + ': ' + (available ? (enabled ? 'ON' : 'OFF') : 'N/A');
+            button.setAttribute('aria-pressed', String(available && enabled));
+            button.disabled = !available;
+            if (!available) button.title = 'Audio is unavailable in this browser';
+        }
+    }
+
+    // Create on a user gesture; an existing context can also resume on tab return.
+    function activate() {
+        if (!available || document.hidden || (!sfxEnabled && !musicEnabled)) return;
+        try {
+            if (!context) {
+                context = new AudioContextClass();
+                master = context.createGain();
+                master.gain.value = 0.55;
+                const compressor = context.createDynamicsCompressor();
+                compressor.threshold.value = -14;
+                compressor.knee.value = 18;
+                compressor.ratio.value = 4;
+                master.connect(compressor);
+                compressor.connect(context.destination);
+                musicBus = context.createGain();
+                musicBus.gain.value = 0.6;
+                musicBus.connect(master);
+                sfxBus = context.createGain();
+                sfxBus.gain.value = 0.7;
+                sfxBus.connect(master);
+
+                noiseBuffer = context.createBuffer(1, context.sampleRate, context.sampleRate);
+                const data = noiseBuffer.getChannelData(0);
+                let seed = 0x1ace;
+                for (let i = 0; i < data.length; i++) {
+                    seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+                    data[i] = (seed >>> 0) / 2147483648 - 1;
+                }
+                context.addEventListener('statechange', syncMusic);
+            }
+            if (context.state !== 'running') context.resume().then(syncMusic).catch(() => {});
+            else syncMusic();
+        } catch {
+            // Missing/failed audio must not prevent the game from starting.
+            stopMusic();
+            if (context) context.close().catch(() => {});
+            available = false;
+            updateControls();
+        }
+    }
+
+    function envelope(source, nodes, bus, time, duration, volume, kind, sustain = false) {
+        const gain = context.createGain();
+        nodes[nodes.length - 1].connect(gain);
+        gain.connect(bus);
+        gain.gain.setValueAtTime(0, time);
+        gain.gain.linearRampToValueAtTime(volume, time + 0.004);
+        if (sustain) {
+            gain.gain.linearRampToValueAtTime(volume * 0.7, time + duration * 0.25);
+            gain.gain.setValueAtTime(volume * 0.7, time + duration * 0.65);
+        }
+        gain.gain.exponentialRampToValueAtTime(0.0001, time + duration);
+        gain.gain.setValueAtTime(0, time + duration + 0.01);
+        const voice = { source, gain, kind };
+        voices.add(voice);
+        source.onended = () => {
+            for (const node of nodes) node.disconnect();
+            gain.disconnect();
+            voices.delete(voice);
+        };
+        source.start(time);
+        source.stop(time + duration + 0.02);
+    }
+
+    function tone(frequency, duration, volume, type, time, kind = 'sfx', endFrequency = frequency) {
+        if (voices.size >= 64) return;
+        const oscillator = context.createOscillator();
+        oscillator.type = type;
+        oscillator.frequency.setValueAtTime(frequency, time);
+        oscillator.frequency.exponentialRampToValueAtTime(endFrequency, time + duration);
+        envelope(oscillator, [oscillator], kind === 'music' ? musicBus : sfxBus,
+            time, duration, volume, kind, kind === 'music' && type !== 'sine');
+    }
+
+    function noise(duration, volume, frequency, time, kind = 'sfx', type = 'lowpass') {
+        if (voices.size >= 64) return;
+        const source = context.createBufferSource();
+        source.buffer = noiseBuffer;
+        const filter = context.createBiquadFilter();
+        filter.type = type;
+        filter.frequency.value = frequency;
+        source.connect(filter);
+        envelope(source, [source, filter], kind === 'music' ? musicBus : sfxBus,
+            time, duration, volume, kind);
+    }
+
+    function stopVoices(kind, immediately = false) {
+        if (!context) return;
+        const now = context.currentTime;
+        for (const voice of voices) {
+            if (kind && voice.kind !== kind) continue;
+            voice.gain.gain.cancelScheduledValues(now);
+            voice.gain.gain.setTargetAtTime(0.0001, now, 0.003);
+            if (immediately) voice.gain.disconnect();
+            voice.source.stop(now + (immediately ? 0 : 0.02));
+        }
+    }
+
+    const hz = midi => 440 * Math.pow(2, (midi - 69) / 12);
+
+    // Original eight-bar hook in D minor: Dm–Bb–F–C, with an answering phrase.
+    // Each slot is a sixteenth note; zero lets the previous note ring briefly.
+    const melody = [
+        [74, 0, 77, 81, 0, 77, 74, 0, 72, 0, 74, 77, 0, 0, 69, 0],
+        [70, 0, 74, 77, 0, 74, 70, 0, 69, 0, 70, 74, 77, 0, 74, 0],
+        [72, 0, 77, 81, 0, 79, 77, 0, 76, 0, 77, 81, 84, 0, 81, 0],
+        [79, 0, 76, 72, 0, 76, 79, 0, 81, 79, 76, 0, 72, 0, 0, 0],
+        [74, 77, 81, 0, 86, 0, 84, 81, 77, 0, 81, 77, 74, 0, 72, 0],
+        [70, 74, 77, 0, 82, 0, 81, 77, 74, 0, 77, 74, 70, 0, 74, 0],
+        [77, 0, 81, 84, 0, 81, 77, 0, 79, 0, 81, 84, 89, 0, 88, 0],
+        [84, 0, 79, 76, 0, 79, 84, 0, 81, 79, 76, 72, 69, 0, 72, 0],
+    ];
+    const chords = [[38, 3, 7], [34, 4, 7], [41, 4, 7], [36, 4, 7]];
+
+    function musicStep(index, time, length) {
+        const bar = Math.floor(index / 16) % melody.length;
+        const beat = index % 16;
+        const [root, third, fifth] = chords[bar % chords.length];
+        const note = melody[bar][beat];
+        if (note) {
+            const duration = length * (melody[bar][beat + 1] === 0 ? 1.65 : 0.8);
+            tone(hz(note), duration, 0.14, 'square', time, 'music');
+        }
+        // Quiet, sparkling arpeggios leave the lead and effects in front.
+        const arp = [0, fifth, 12, third, fifth, 12, third + 12, fifth][beat % 8];
+        tone(hz(root + 24 + arp), length * 0.65, 0.045, 'square', time, 'music');
+        if (beat % 2 === 0) {
+            const bass = root + (beat % 8 === 6 ? fifth : beat % 8 === 4 ? 12 : 0);
+            tone(hz(bass), length * 1.6, 0.25, 'triangle', time, 'music');
+        }
+        // Synth kick, noise snare, and short hats; a fill turns the loop around.
+        if (beat === 0 || beat === 8 || beat === 10) {
+            tone(125, 0.12, 0.28, 'sine', time, 'music', 38);
+        }
+        if (beat === 4 || beat === 12 || (bar === 7 && beat >= 14)) {
+            noise(0.09, 0.2, 1800, time, 'music', 'highpass');
+            tone(180, 0.065, 0.1, 'triangle', time, 'music', 70);
+        }
+        noise(beat % 4 === 2 ? 0.055 : 0.022, beat % 2 ? 0.07 : 0.045,
+            6500, time, 'music', 'highpass');
+    }
+
+    function scheduleMusic() {
+        if (!context || context.state !== 'running' || document.hidden) return;
+        const length = 60 / (132 + (currentLevel - 1) * 8) / 4;
+        // Do not replay missed notes after a delayed timer or device interruption.
+        if (nextStepTime < context.currentTime) nextStepTime = context.currentTime + 0.02;
+        while (nextStepTime < context.currentTime + 0.12) {
+            musicStep(step, nextStepTime, length);
+            step = (step + 1) % 128;
+            nextStepTime += length;
+        }
+    }
+
+    function stopMusic() {
+        if (timer !== null) clearInterval(timer);
+        timer = null;
+        stopVoices('music');
+    }
+
+    function syncMusic() {
+        if (!context || context.state !== 'running' || !playing || !musicEnabled || document.hidden) {
+            stopMusic();
+            return;
+        }
+        if (timer !== null) return;
+        nextStepTime = context.currentTime + 0.08;
+        timer = setInterval(scheduleMusic, 25);
+        scheduleMusic();
+    }
+
+    function setPlaying(value, level = 1) {
+        stopMusic();
+        if (value) {
+            stopVoices('sfx', true);
+            lastEffect.clear();
+        }
+        playing = value;
+        currentLevel = level;
+        step = 0;
+        marchNote = 0;
+        syncMusic();
+    }
+
+    function play(name) {
+        if (!sfxEnabled || !context || context.state !== 'running' || document.hidden) return;
+        const time = context.currentTime + 0.005;
+        if (time - (lastEffect.get(name) ?? -Infinity) < 0.04) return;
+        lastEffect.set(name, time);
+        const tune = (notes, gap = 0.1) => notes.forEach((note, i) =>
+            tone(hz(note), i === notes.length - 1 ? gap * 2.5 : gap * 0.85,
+                0.18, 'square', time + i * gap));
+        switch (name) {
+            case 'shot': tone(1050, 0.12, 0.18, 'square', time, 'sfx', 170); break;
+            case 'alienShot': tone(260, 0.16, 0.12, 'sawtooth', time, 'sfx', 90); break;
+            case 'destroy':
+                noise(0.16, 0.3, 2200, time);
+                tone(180, 0.16, 0.2, 'triangle', time, 'sfx', 45);
+                break;
+            case 'bunker': noise(0.045, 0.17, 1200, time); break;
+            case 'hit':
+                noise(0.4, 0.4, 1400, time);
+                tone(140, 0.4, 0.2, 'sawtooth', time, 'sfx', 35);
+                break;
+            case 'dive': tone(550, 0.4, 0.12, 'triangle', time, 'sfx', 130); break;
+            case 'march':
+                tone(hz([38, 36, 34, 33][marchNote++ % 4]), 0.07, 0.14, 'square', time);
+                break;
+            case 'start': tune([62, 69, 74], 0.065); break;
+            case 'wave': tune([74, 77, 81]); break;
+            case 'level': tune([74, 77, 81, 86], 0.12); break;
+            case 'gameOver': tune([74, 72, 69, 65, 62], 0.18); break;
+            case 'victory': tune([74, 77, 81, 86, 84, 86, 89, 86], 0.13); break;
+        }
+    }
+
+    function applyPreferences() {
+        try {
+            localStorage.setItem('invaders_sfx', sfxEnabled ? 'on' : 'off');
+            localStorage.setItem('invaders_music', musicEnabled ? 'on' : 'off');
+        } catch { /* Settings are optional when storage is unavailable. */ }
+        updateControls();
+        if (!sfxEnabled) stopVoices('sfx');
+        syncMusic();
+        activate();
+    }
+
+    function toggleMute() {
+        if (sfxEnabled || musicEnabled) {
+            previousMix = [sfxEnabled, musicEnabled];
+            sfxEnabled = musicEnabled = false;
+        } else {
+            [sfxEnabled, musicEnabled] = previousMix || [true, true];
+        }
+        applyPreferences();
+    }
+
+    sfxButton.addEventListener('click', event => {
+        sfxEnabled = !sfxEnabled;
+        applyPreferences();
+        if (event.detail) sfxButton.blur();
+    });
+    musicButton.addEventListener('click', event => {
+        musicEnabled = !musicEnabled;
+        applyPreferences();
+        if (event.detail) musicButton.blur();
+    });
+    document.addEventListener('visibilitychange', () => {
+        if (!context) return;
+        if (document.hidden) {
+            stopMusic();
+            stopVoices(undefined, true);
+            context.suspend().catch(() => {});
+        } else {
+            activate();
+        }
+    });
+    updateControls();
+    return { activate, setPlaying, play, toggleMute };
+})();
 
 // ============================================================
 // GAME STATE
@@ -366,6 +702,7 @@ let formationDropAmount = 0;
 let alienFireTimer = 0;
 let alienFireInterval = 2.0;
 let diveTimer = 0;
+let formationSoundTimer = 0;
 
 // Player fire cooldown
 let playerFireCD = 0;
@@ -511,6 +848,7 @@ function spawnWave() {
     aliens = [];
     formationDir = 1;
     formationDropAmount = 0;
+    formationSoundTimer = 0;
 
     const formation = config.formation;
     const startY = 60;
@@ -554,21 +892,23 @@ function spawnWave() {
             }
         }
     } else if (formation === 'vshape') {
-        // V formation with scattered elements
-        // Left arm and right arm of the V, plus some scattered
+        // Keep all 42 aliens and a central gap, with room to travel sideways.
+        // The old 15-column layout was wider than the canvas and hit both
+        // walls every frame, repeatedly reversing and dropping the whole fleet.
         const rows = 6;
+        const gap = 1;
+        const spacingX = ALIEN_W + 4;
         for (let r = 0; r < rows; r++) {
             // Left arm: moves right as row increases
             const leftCount = rows - r;
             const rightCount = rows - r;
-            const gap = 3; // gap in middle
             const totalCols = leftCount + gap + rightCount;
-            const startX = (CW - (totalCols - 1) * ALIEN_SPACING_X) / 2 - ALIEN_W / 2;
+            const startX = (CW - (totalCols - 1) * spacingX) / 2 - ALIEN_W / 2;
 
             for (let c = 0; c < leftCount; c++) {
                 const type = r < 2 ? 0 : (r < 4 ? 1 : 2);
                 aliens.push(createAlien(
-                    startX + c * ALIEN_SPACING_X,
+                    startX + c * spacingX,
                     startY + r * ALIEN_SPACING_Y,
                     type
                 ));
@@ -576,7 +916,7 @@ function spawnWave() {
             for (let c = 0; c < rightCount; c++) {
                 const type = r < 2 ? 0 : (r < 4 ? 1 : 2);
                 aliens.push(createAlien(
-                    startX + (leftCount + gap + c) * ALIEN_SPACING_X,
+                    startX + (leftCount + gap + c) * spacingX,
                     startY + r * ALIEN_SPACING_Y,
                     type
                 ));
@@ -597,10 +937,8 @@ function createAlien(x, y, type) {
         w: ALIEN_W, h: ALIEN_H,
         type: type,
         alive: true,
-        diving: false,
-        diveX: 0, diveY: 0,
-        homeX: x, homeY: y,  // current formation position
-        spawnY: y,            // original spawn row (for wrap-to-top)
+        flight: 'formation', // formation, diving, returning
+        homeX: x, homeY: y,  // reserved slot; vertical drop is shared by the formation
         animFrame: 0,
     };
 }
@@ -637,6 +975,15 @@ function createBunkers() {
 // GAME LOGIC
 // ============================================================
 function update(dt) {
+    // Check collisions at least every 1/60 second. Otherwise a slow frame can
+    // move a bullet completely through a thin bunker block or returning alien.
+    const steps = Math.max(1, Math.ceil(dt * 60));
+    for (let i = 0; i < steps; i++) {
+        updateStep(dt / steps);
+    }
+}
+
+function updateStep(dt) {
     if (gameState !== 'playing') return;
 
     updateStars(dt);
@@ -651,6 +998,7 @@ function update(dt) {
     }
     checkCollisions();
     updateParticles(dt);
+    if (gameState !== 'playing') return;
 
     if (playerInvuln > 0) playerInvuln -= dt;
 
@@ -660,6 +1008,7 @@ function update(dt) {
         if (wave < totalWaves) {
             wave++;
             spawnWave();
+            gameAudio.play('wave');
             updateHUD();
         } else {
             // Level complete
@@ -671,14 +1020,11 @@ function update(dt) {
         }
     }
 
-    // Check alien reached the player level → wrap formation back to top
-    // Instead of game over, aliens teleport back to the top and the player
-    // loses a life as a penalty for letting them get that low.
+    // Recycle a low formation without penalizing a missed attack. Airborne
+    // aliens complete their own trip; only actual collisions cost a life.
     for (let a of aliveAliens) {
-        const ay = a.diving ? a.y : a.homeY + getFormationOffsetY();
-        if (ay + ALIEN_H >= PLAYER_Y) {
+        if (a.flight === 'formation' && a.y + a.h >= PLAYER_Y) {
             wrapFormationToTop();
-            playerHit();
             return;
         }
     }
@@ -712,36 +1058,28 @@ function updatePlayer(dt) {
     }
 }
 
-// Formation moves as a group; individual aliens stay at their home position
-// unless diving.
+// Slots move as a group, including the empty slots of airborne aliens.
 function getFormationOffsetY() {
     return formationDropAmount;
 }
 
-// When the formation gets too low, wrap all aliens back to the top of the
-// screen. Diving aliens are recalled to formation first.
+// Reset the formation's drop without interrupting an alien's flight. Its
+// reserved slot returns to the top and it will catch up on the return leg.
 function wrapFormationToTop() {
-    // Recall any diving aliens back to formation
-    for (let a of aliens) {
-        if (!a.alive) continue;
-        a.diving = false;
-    }
-    // Reset formation drop counter and restore all aliens to their spawn rows
     formationDropAmount = 0;
     for (let a of aliens) {
-        if (!a.alive) continue;
-        a.homeY = a.spawnY;
-        a.y = a.spawnY;
+        if (!a.alive || a.flight !== 'formation') continue;
+        a.y = a.homeY;
         a.x = a.homeX;
     }
 }
 
 function updateFormation(dt) {
-    // Find leftmost and rightmost alive aliens (non-diving)
+    // Reserve each living alien's slot, even while it is away from the grid.
     let minX = CW, maxX = 0;
     let count = 0;
     for (let a of aliens) {
-        if (!a.alive || a.diving) continue;
+        if (!a.alive) continue;
         if (a.homeX < minX) minX = a.homeX;
         if (a.homeX + ALIEN_W > maxX) maxX = a.homeX + ALIEN_W;
         count++;
@@ -752,42 +1090,47 @@ function updateFormation(dt) {
     const speedMul = 1 + (1 - count / 55) * 2; // up to 3x when few remain
     const speed = formationSpeed * speedMul;
 
-    // Move horizontally
-    const dx = speed * formationDir * dt;
+    formationSoundTimer -= dt;
+    if (formationSoundTimer <= 0) {
+        gameAudio.play('march');
+        formationSoundTimer = Math.max(0.16, 0.8 / speedMul * 30 / formationSpeed);
+    }
+
+    // Stop at the wall before reversing so a slow frame cannot push slots out
+    // of bounds. Empty slots belonging to airborne aliens share the same move.
+    const requestedDx = speed * formationDir * dt;
+    const dx = Math.max(10 - minX, Math.min(CW - 10 - maxX, requestedDx));
     for (let a of aliens) {
-        if (!a.alive || a.diving) continue;
+        if (!a.alive) continue;
         a.homeX += dx;
-        a.x = a.homeX;
+        if (a.flight === 'formation') a.x = a.homeX;
     }
 
     // Check edges
-    if ((formationDir > 0 && maxX + dx >= CW - 10) ||
-        (formationDir < 0 && minX + dx <= 10)) {
+    if ((formationDir > 0 && maxX + requestedDx >= CW - 10) ||
+        (formationDir < 0 && minX + requestedDx <= 10)) {
         formationDir *= -1;
         formationDropAmount += 16; // drop down
-        for (let a of aliens) {
-            if (!a.alive || a.diving) continue;
-            a.homeY += 16;
-            a.y = a.homeY;
-        }
     }
 
     // Occasionally trigger dives
     diveTimer += dt;
-    if (diveTimer > 3.0 && Math.random() < 0.02 && count > 3) {
+    const diveChance = 1 - Math.pow(1 - ALIEN_DIVE_CHANCE, dt * 60);
+    if (diveTimer > 3.0 && Math.random() < diveChance && count > 3) {
         triggerDive();
         diveTimer = 0;
     }
 }
 
 function triggerDive() {
-    // Pick a random non-diving alien to dive toward the player
-    const candidates = aliens.filter(a => a.alive && !a.diving);
+    // Returning aliens finish docking before they can launch another attack.
+    const candidates = aliens.filter(a => a.alive && a.flight === 'formation');
     if (candidates.length === 0) return;
     const a = candidates[Math.floor(Math.random() * candidates.length)];
-    a.diving = true;
-    a.diveX = a.x;
-    a.diveY = a.y;
+    a.x = a.homeX;
+    a.y = a.homeY + getFormationOffsetY();
+    a.flight = 'diving';
+    gameAudio.play('dive');
 }
 
 function updateAliens(dt) {
@@ -795,24 +1138,33 @@ function updateAliens(dt) {
         if (!a.alive) continue;
         a.animFrame += dt * 4;
 
-        if (a.diving) {
+        if (a.flight === 'diving') {
             // Move toward bottom of screen, curving toward player
-            a.diveY += ALIEN_DIVE_SPEED * dt;
+            a.y += ALIEN_DIVE_SPEED * dt;
 
             // Curve horizontally toward player
             const targetX = player.x + player.w / 2;
-            const dx = targetX - (a.diveX + a.w / 2);
-            a.diveX += dx * 0.5 * dt;
+            const dx = targetX - (a.x + a.w / 2);
+            a.x += dx * 0.5 * dt;
 
-            a.x = a.diveX;
-            a.y = a.diveY;
-
-            // If it goes off screen bottom, it returns to formation
-            if (a.diveY > CH + 50) {
-                a.diving = false;
+            // A missed dive exits fully before reappearing above the screen.
+            if (a.y >= CH + a.h) {
+                a.flight = 'returning';
+                a.y = -a.h;
+            }
+        } else if (a.flight === 'returning') {
+            // Follow the moving empty slot instead of teleporting into the grid.
+            const dx = a.homeX - a.x;
+            const dy = a.homeY + getFormationOffsetY() - a.y;
+            const distance = Math.hypot(dx, dy);
+            const travel = ALIEN_RETURN_SPEED * dt;
+            if (distance <= travel) {
                 a.x = a.homeX;
-                a.y = a.homeY;
-                a.diveY = a.homeY;
+                a.y = a.homeY + getFormationOffsetY();
+                a.flight = 'formation';
+            } else {
+                a.x += dx / distance * travel;
+                a.y += dy / distance * travel;
             }
         } else {
             a.x = a.homeX;
@@ -822,6 +1174,7 @@ function updateAliens(dt) {
 }
 
 function fireBullet() {
+    gameAudio.play('shot');
     playerBullets.push({
         x: player.x + player.w / 2 - BULLET_W / 2,
         y: player.y - BULLET_H,
@@ -831,7 +1184,7 @@ function fireBullet() {
 
 function alienFire() {
     // Find bottommost alien in each column (those are the ones that can shoot)
-    const aliveNonDiving = aliens.filter(a => a.alive && !a.diving);
+    const aliveNonDiving = aliens.filter(a => a.alive && a.flight === 'formation');
     if (aliveNonDiving.length === 0) return;
 
     // Pick a random alien from the bottom rows
@@ -844,6 +1197,7 @@ function alienFire() {
     if (shooters.length === 0) return;
 
     const shooter = shooters[Math.floor(Math.random() * shooters.length)];
+    gameAudio.play('alienShot');
     alienBullets.push({
         x: shooter.x + shooter.w / 2 - BULLET_W / 2,
         y: shooter.y + shooter.h,
@@ -884,6 +1238,7 @@ function checkCollisions() {
                 a.alive = false;
                 b.dead = true;
                 score += ALIEN_POINTS[a.type];
+                gameAudio.play('destroy');
                 createExplosion(a.x + a.w/2, a.y + a.h/2, getAlienColor(a.type));
                 updateHUD();
                 break;
@@ -911,10 +1266,10 @@ function checkCollisions() {
     }
     alienBullets = alienBullets.filter(b => !b.dead);
 
-    // Diving aliens vs player
+    // Alien contact costs a life; passing the ship or screen edge does not.
     if (player.alive && playerInvuln <= 0) {
         for (let a of aliens) {
-            if (!a.alive || !a.diving) continue;
+            if (!a.alive) continue;
             if (rectsOverlap(a.x, a.y, a.w, a.h, player.x, player.y, player.w, player.h)) {
                 a.alive = false;
                 playerHit();
@@ -934,6 +1289,7 @@ function checkBulletVsBunker(bullet, isPlayerBullet) {
             if (rectsOverlap(bullet.x, bullet.y, bullet.w, bullet.h, blk.bx, blk.by, BUNKER_BLOCK, BUNKER_BLOCK)) {
                 blk.hp--;
                 bullet.dead = true;
+                gameAudio.play('bunker');
                 // Small particle effect
                 createExplosion(blk.bx + BUNKER_BLOCK/2, blk.by + BUNKER_BLOCK/2, '#080', 3);
                 return;
@@ -945,6 +1301,7 @@ function checkBulletVsBunker(bullet, isPlayerBullet) {
 function playerHit(forced) {
     if (playerInvuln > 0 && !forced) return;
     lives--;
+    gameAudio.play('hit');
     playerInvuln = 2.5;
     updateHUD();
 
@@ -1027,8 +1384,7 @@ function render() {
     for (let bunker of bunkers) {
         for (let blk of bunker.blocks) {
             if (blk.hp <= 0) continue;
-            const alpha = blk.hp / 3;
-            ctx.fillStyle = blk.hp >= 2 ? '#080' : (blk.hp === 2 ? '#060' : '#030');
+            ctx.fillStyle = blk.hp === 3 ? '#080' : (blk.hp === 2 ? '#060' : '#030');
             ctx.fillRect(blk.bx, blk.by, BUNKER_BLOCK, BUNKER_BLOCK);
         }
     }
@@ -1036,7 +1392,7 @@ function render() {
     // Aliens
     for (let a of aliens) {
         if (!a.alive) continue;
-        const color = a.diving ? '#ff0' : getAlienColor(a.type);
+        const color = a.flight === 'diving' ? '#ff0' : getAlienColor(a.type);
         const sprite = ALIEN_SPRITES[a.type] || ALIEN_SPRITES[2];
         const scale = ALIEN_W / sprite[0].length;
         // Simple 2-frame animation: shift pixels slightly
@@ -1116,6 +1472,8 @@ function showOverlay(id) {
 
 function showLevelTransition() {
     gameState = 'levelTransition';
+    gameAudio.setPlaying(false);
+    gameAudio.play('level');
     const nextLvl = level + 1;
     const config = LEVELS[nextLvl - 1];
     document.getElementById('level-title').textContent = config.name.split('—')[0].trim();
@@ -1124,18 +1482,21 @@ function showLevelTransition() {
 }
 
 function showGameOver() {
+    gameState = 'gameOver';
+    gameAudio.setPlaying(false);
+    gameAudio.play('gameOver');
     document.getElementById('gameover-score').textContent = 'Score: ' + score.toLocaleString();
     document.getElementById('gameover-level').textContent = 'Level: ' + level;
-    const lastName = localStorage.getItem('invaders_last_name');
-    if (lastName) document.getElementById('name-input').value = lastName;
+    document.getElementById('name-input').value = (readScoreStorage('invaders_last_name') || '').substring(0, 12);
     showOverlay('gameover-screen');
 }
 
 function showVictory() {
     gameState = 'victory';
+    gameAudio.setPlaying(false);
+    gameAudio.play('victory');
     document.getElementById('victory-score').textContent = 'Score: ' + score.toLocaleString();
-    const lastName = localStorage.getItem('invaders_last_name');
-    if (lastName) document.getElementById('victory-name').value = lastName;
+    document.getElementById('victory-name').value = (readScoreStorage('invaders_last_name') || '').substring(0, 12);
     showOverlay('victory-screen');
 }
 
@@ -1143,17 +1504,55 @@ function showVictory() {
 // LEADERBOARD
 // ============================================================
 const LB_KEY = 'invaders_leaderboard';
+const sessionScoreStorage = new Map();
+const unsavedScoreKeys = new Set();
+
+// Scores remain usable for this session when browser storage is blocked or full.
+function readScoreStorage(key) {
+    if (!unsavedScoreKeys.has(key)) {
+        try {
+            const value = localStorage.getItem(key);
+            sessionScoreStorage.set(key, value);
+            return value;
+        } catch { /* Fall back to the last value read or written this session. */ }
+    }
+    return sessionScoreStorage.get(key) ?? null;
+}
+
+function writeScoreStorage(key, value) {
+    sessionScoreStorage.set(key, value);
+    try {
+        localStorage.setItem(key, value);
+        unsavedScoreKeys.delete(key);
+    } catch {
+        unsavedScoreKeys.add(key);
+    }
+}
+
+function validLeaderboard(entries) {
+    if (!Array.isArray(entries)) return [];
+    return entries.filter(entry => entry && typeof entry.name === 'string' &&
+        Number.isSafeInteger(entry.score) && entry.score >= 0 &&
+        Number.isInteger(entry.level) && entry.level >= 1 && entry.level <= LEVELS.length)
+        .map(entry => ({
+            name: entry.name.trim().substring(0, 12) || 'Anonymous',
+            score: entry.score,
+            level: entry.level,
+            date: typeof entry.date === 'string' ? entry.date : '',
+        }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 10);
+}
 
 function getLeaderboard() {
-    try { return JSON.parse(localStorage.getItem(LB_KEY)) || []; }
+    try { return validLeaderboard(JSON.parse(readScoreStorage(LB_KEY))); }
     catch { return []; }
 }
 
 function addToLeaderboard(name, sc, lvl) {
     const entries = getLeaderboard();
     entries.push({ name, score: sc, level: lvl, date: new Date().toISOString() });
-    entries.sort((a, b) => b.score - a.score);
-    localStorage.setItem(LB_KEY, JSON.stringify(entries.slice(0, 10)));
+    writeScoreStorage(LB_KEY, JSON.stringify(validLeaderboard(entries)));
     renderLeaderboards();
 }
 
@@ -1183,41 +1582,49 @@ function escapeHtml(text) {
 // GAME FLOW
 // ============================================================
 function beginGame() {
+    gameAudio.activate();
     score = 0;
     lives = 3;
     level = 1;
     player = null;
     startLevel(1);
     gameState = 'playing';
+    gameAudio.setPlaying(true, level);
+    gameAudio.play('start');
     updateHUD();
     showOverlay(null);
+    if (document.activeElement?.closest('.overlay')) document.activeElement.blur();
 }
 
 function continueToNextLevel() {
+    gameAudio.activate();
     startLevel(level + 1);
     gameState = 'playing';
+    gameAudio.setPlaying(true, level);
+    gameAudio.play('start');
     updateHUD();
     showOverlay(null);
+    if (document.activeElement?.closest('.overlay')) document.activeElement.blur();
 }
 
 function submitGameOver() {
+    if (gameState !== 'gameOver') return;
     let name = document.getElementById('name-input').value.trim() || 'Anonymous';
     name = name.substring(0, 12);
-    localStorage.setItem('invaders_last_name', name);
+    writeScoreStorage('invaders_last_name', name);
     addToLeaderboard(name, score, level);
     showOverlay('start-screen');
     gameState = 'start';
-    renderLeaderboards();
 }
 
 function submitVictory() {
+    if (gameState !== 'victory') return;
     let name = document.getElementById('victory-name').value.trim() || 'Anonymous';
     name = name.substring(0, 12);
-    localStorage.setItem('invaders_last_name', name);
+    writeScoreStorage('invaders_last_name', name);
     addToLeaderboard(name, score, level);
     showOverlay('start-screen');
     gameState = 'start';
-    renderLeaderboards();
 }
 
 // ============================================================
@@ -1237,13 +1644,54 @@ function gameLoop(timestamp) {
 // ============================================================
 // INPUT
 // ============================================================
+// A control stays held until every keyboard, button, and canvas source releases it.
+const inputSources = new Map();
+let canvasTouchId = null;
+let canvasTouchStartX = 0;
+
+function setInputSource(source, heldKeys) {
+    if (heldKeys.length) inputSources.set(source, heldKeys);
+    else inputSources.delete(source);
+    keys = {};
+    for (const sourceKeys of inputSources.values()) {
+        for (const key of sourceKeys) keys[key] = true;
+    }
+}
+
+function clearInput() {
+    inputSources.clear();
+    keys = {};
+    canvasTouchId = null;
+}
+
+function inputKey(event) {
+    return event.key === 'Spacebar' ? ' ' :
+        (event.key.length === 1 ? event.key.toLowerCase() : event.key);
+}
+
 window.addEventListener('keydown', function(e) {
-    keys[e.key] = true;
-    if (e.key === ' ') e.preventDefault();
+    if (e.target.matches('input, textarea') || e.target.isContentEditable) return;
+    if (e.key.toLowerCase() === 'm' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (!e.repeat) gameAudio.toggleMute();
+        e.preventDefault();
+        return;
+    }
+    if (e.target.matches('button') && (e.key === ' ' || e.key === 'Enter')) return;
+    const key = inputKey(e);
+    if (['ArrowLeft', 'ArrowRight', 'a', 'd', ' '].includes(key)) {
+        gameAudio.activate();
+        setInputSource('keyboard:' + (e.code || key), [key]);
+        e.preventDefault();
+    }
 });
 
 window.addEventListener('keyup', function(e) {
-    keys[e.key] = false;
+    setInputSource('keyboard:' + (e.code || inputKey(e)), []);
+});
+
+window.addEventListener('blur', clearInput);
+document.addEventListener('visibilitychange', function() {
+    if (document.hidden) clearInput();
 });
 
 // Touch controls
@@ -1252,56 +1700,63 @@ function bindTouchBtn(id, key) {
     if (!el) return;
     el.addEventListener('touchstart', function(e) {
         e.preventDefault();
-        keys[key] = true;
+        gameAudio.activate();
+        setInputSource('touch:' + id, [key]);
     }, { passive: false });
     el.addEventListener('touchend', function(e) {
         e.preventDefault();
-        keys[key] = false;
+        setInputSource('touch:' + id, e.targetTouches.length ? [key] : []);
     }, { passive: false });
     el.addEventListener('touchcancel', function(e) {
-        keys[key] = false;
+        setInputSource('touch:' + id, e.targetTouches.length ? [key] : []);
     });
     // Mouse for testing
-    el.addEventListener('mousedown', function() { keys[key] = true; });
-    el.addEventListener('mouseup', function() { keys[key] = false; });
-    el.addEventListener('mouseleave', function() { keys[key] = false; });
+    el.addEventListener('mousedown', function(e) {
+        if (e.button !== 0) return;
+        gameAudio.activate();
+        setInputSource('mouse:' + id, [key]);
+    });
+    el.addEventListener('mouseup', function() { setInputSource('mouse:' + id, []); });
+    el.addEventListener('mouseleave', function() { setInputSource('mouse:' + id, []); });
 }
 
 bindTouchBtn('btn-left', 'ArrowLeft');
 bindTouchBtn('btn-right', 'ArrowRight');
 bindTouchBtn('btn-fire', ' ');
 
-// Swipe on canvas: touch left/right half to move, tap to fire
+// Hold the canvas to fire; drag left or right to steer while firing.
 (function() {
-    let touchStartX = 0, touchActive = false;
     canvas.addEventListener('touchstart', function(e) {
         e.preventDefault();
-        const t = e.touches[0];
-        touchStartX = t.clientX;
-        touchActive = true;
-        // Tap = fire
-        keys[' '] = true;
+        if (canvasTouchId !== null) return;
+        const t = e.changedTouches[0];
+        canvasTouchId = t.identifier;
+        canvasTouchStartX = t.clientX;
+        gameAudio.activate();
+        setInputSource('canvas', [' ']);
     }, { passive: false });
 
     canvas.addEventListener('touchmove', function(e) {
         e.preventDefault();
-        if (!touchActive) return;
-        const t = e.touches[0];
-        const dx = t.clientX - touchStartX;
+        if (canvasTouchId === null) return;
+        const t = Array.from(e.touches).find(touch => touch.identifier === canvasTouchId);
+        if (!t) return;
+        const dx = t.clientX - canvasTouchStartX;
+        const heldKeys = [' '];
         if (Math.abs(dx) > 15) {
-            keys['ArrowLeft'] = dx < 0;
-            keys['ArrowRight'] = dx > 0;
-            keys[' '] = false; // stop firing while moving
+            heldKeys.push(dx < 0 ? 'ArrowLeft' : 'ArrowRight');
         }
+        setInputSource('canvas', heldKeys);
     }, { passive: false });
 
-    canvas.addEventListener('touchend', function(e) {
+    function endCanvasTouch(e) {
         e.preventDefault();
-        touchActive = false;
-        keys['ArrowLeft'] = false;
-        keys['ArrowRight'] = false;
-        keys[' '] = false;
-    }, { passive: false });
+        if (!Array.from(e.changedTouches).some(t => t.identifier === canvasTouchId)) return;
+        canvasTouchId = null;
+        setInputSource('canvas', []);
+    }
+    canvas.addEventListener('touchend', endCanvasTouch, { passive: false });
+    canvas.addEventListener('touchcancel', endCanvasTouch, { passive: false });
 })();
 
 // Prevent zoom
